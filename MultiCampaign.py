@@ -1,105 +1,143 @@
-# Import required libraries
-import os  # For accessing environment variables
-from dotenv import load_dotenv  # For loading our secret keys from .env.local file
-import mailchimp_marketing as MailchimpMarketing  # The main Mailchimp API library
-from mailchimp_marketing.api_client import ApiClientError  # For handling Mailchimp errors
+import pandas as pd
+from mailchimp_marketing import Client
+from dotenv import load_dotenv
+import os
+import time  # for adding delays between API calls
+from datetime import datetime
+from string import Template
 
-# Load our secret keys from .env.local file
+# Load environment variables
 load_dotenv()
 
-# # Set up connection to Mailchimp
-client = MailchimpMarketing.Client()
+# Initialize Mailchimp client
+mailchimp = Client()
+mailchimp.set_config({
+    "api_key": os.getenv("MAILCHIMP_API_KEY"),
+    "server": os.getenv("MAILCHIMP_SERVER_PREFIX")
+})
 
-# Configure our connection using our secret API key and server
-client.set_config({
-    "api_key": os.getenv("MAILCHIMP_API_KEY"),  # Get API key from .env.local
-    "server": os.getenv("MAILCHIMP_SERVER_PREFIX")  # Get server prefix from .env.local
-}) # Be careful with logging API keys in production!
-
-def create_campaign(list_id, subject_line, preview_text, title, from_name, reply_to):
-    # """
-    # Creates a new email campaign in Mailchimp.
-
+def get_email_template(row):
+    """Read HTML template and substitute variables from Excel row"""
     try:
-        # Create a new campaign with specified settings
-        campaign = client.campaigns.create({
-            "type": "regular",  # Standard email campaign
+        # Read the template file
+        with open('GN-template.html', 'r', encoding='utf-8') as file:
+            template_content = file.read()
+        
+        # Handle optional secondary_body_text with type checking
+        def clean_text(value):
+            """Helper function to clean text values"""
+            if pd.isna(value):  # Check if value is NaN
+                return ''
+            if isinstance(value, float):  # Convert float to string
+                return '' if pd.isna(value) else str(value).rstrip('0').rstrip('.')
+            return str(value).strip()  # Convert to string and strip whitespace
+        
+        # Clean the secondary text
+        secondary_text = clean_text(row.get('secondary_body_text', ''))
+        if not secondary_text:
+            # Remove the entire paragraph containing secondary_body_text if it's empty
+            template_content = template_content.replace('<p>secondary_body_text</p>', '')
+        
+        # Create template object
+        template = Template(template_content)
+        
+        # Create dictionary of variables for substitution with cleaned values
+        template_vars = {
+            'campaign_name': clean_text(row['Campaign Name']),
+            'subject_line': clean_text(row['subject_line']),
+            'preview_text': clean_text(row['preview_text']),
+            'green_body_header': clean_text(row['green_body_header']),
+            'black_body_header': clean_text(row['black_body_header']),
+            'body_text': clean_text(row['body_text']),
+            'secondary_body_text': secondary_text,
+            'testimonial_text': clean_text(row['testimonial_text']),
+            'call_to_action_url': clean_text(row['call_to_action_url']),
+            'call_to_action_text': clean_text(row['call_to_action_text'])
+        }
+        
+        # Substitute variables in template
+        html_content = template.safe_substitute(template_vars)
+        
+        print("Template loaded and variables substituted successfully")
+        return html_content
+        
+    except FileNotFoundError:
+        print("Error: GN-template.html not found in current directory")
+        raise
+    except Exception as e:
+        print(f"Error processing template: {str(e)}")
+        raise
+
+def create_campaign_from_row(row):
+    try:
+        # Create campaign settings
+        campaign_settings = {
             "recipients": {
-                "list_id": list_id  # Which mailing list to send to
+                "list_id": row['List ID']
             },
             "settings": {
-                "subject_line": subject_line,
-                "preview_text": preview_text,
-                "title": title,
-                "from_name": from_name,
-                "reply_to": reply_to,
-                "to_name": "*|FNAME|*"  # Will be replaced with recipient's first name
-            }
-        })
-        print("New campaign created with ID:", campaign["id"])
-        return campaign["id"]
-    except ApiClientError as error:
-        print("An exception occurred: {}".format(error.text))
-        return None  # Add explicit return None
-
-def add_content_to_campaign(campaign_id, html_content):
-    # """
-    # Adds HTML content to an existing campaign.
-    
-    # Parameters:
-    #     campaign_id (str): The ID of the campaign to update
-    #     html_content (str): The HTML content of the email
-    # """
-    try:
-        # Add the HTML content to the campaign
-        client.campaigns.set_content(campaign_id, {
+                "subject_line": row['subject_line'],
+                "preview_text": row['preview_text'],
+                "title": row['Campaign Name'],
+                "from_name": row['From Name'],
+                "reply_to": row['Reply-to Email']
+            },
+            "type": "regular"
+        }
+        
+        print(f"\nCreating campaign: {row['Campaign Name']}")
+        campaign = mailchimp.campaigns.create(campaign_settings)
+        campaign_id = campaign['id']
+        print(f"Campaign ID created: {campaign_id}")
+        
+        # Generate HTML content using template
+        html_content = get_email_template(row)
+        
+        # Set campaign content
+        content = {
             "html": html_content
-        })
-        print("Content added to campaign successfully")
-    except ApiClientError as error:
-        print("An exception occurred: {}".format(error.text))
+        }
+        print("Setting campaign content...")
+        mailchimp.campaigns.set_content(campaign_id, content)
+        
+        print(f"Successfully created campaign: {row['Campaign Name']}")
+        return True, campaign_id
+        
+    except Exception as e:
+        print(f"Failed to create campaign {row['Campaign Name']}: {str(e)}")
+        return False, None
 
-
-# Example values - replace these with your actual information
+def main():
+    # Read the Excel file
+    df = pd.read_excel('campaigns.xlsx')
     
-    # Parameters:
-    #     list_id (str): The ID of your mailing list in Mailchimp
-    #     subject_line (str): What recipients will see as the email subject
-    #     preview_text (str): The short preview text shown in email clients
-    #     title (str): Internal name for the campaign (recipients don't see this)
-    #     from_name (str): Name that will appear as the sender
-    #     reply_to (str): Email address that will receive replies
+    results = []
+    
+    # Process each row
+    for index, row in df.iterrows():
+        success, campaign_id = create_campaign_from_row(row)
+        
+        # Store results
+        results.append({
+            'Campaign Name': row['Campaign Name'],
+            'Success': success,
+            'Campaign ID': campaign_id
+        })
+        
+        # Add a small delay to avoid hitting API rate limits
+        time.sleep(1)
+    
+    # Create a results DataFrame and save to Excel
+    results_df = pd.DataFrame(results)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_df.to_excel(f'{timestamp}_campaign_results.xlsx', index=False)
 
-list_id = "90c4971012"  # The ID of your Mailchimp mailing list
-subject_line = "Your first exciting subject line"
-preview_text = "A brief preview of your first email content"
-title = "Internal title for your first campaign"
-from_name = "Your Name or Company Name"
-reply_to = "hoopster.lady@gmail.com"
+if __name__ == "__main__":
+    main()
 
-# Example HTML template for the email
-html_content = """
-<html>
-  <body>
-    <h1>Hello, *|FNAME|*!</h1>
-    <p>This is the content of your first email.</p>
-  </body>
-</html>
-"""
+    # This script creates a new campaign for each row from the campaigns.xlsx file.
+    # to run the code type python3 MultiCampaign.py in the terminal
+    # the results will be saved in a file called <timestamp>_campaign_results.xlsx
 
-# Create the campaign and add content to it
-campaign_id = create_campaign(list_id, subject_line, preview_text, title, from_name, reply_to)
-if campaign_id:  # Only proceed if we got a valid campaign_id
-    add_content_to_campaign(campaign_id, html_content)
-else:
-    print("Failed to create campaign. Cannot add content.")
 
-# End of file - To run this file, type "python3 Campaign.py" in the terminal
 
-# Here's how to find your Mailchimp list ID:
-# Log in to your Mailchimp account
-# Go to Audience → All Contacts
-# Click on "Settings" in the audience dropdown
-# Click on "Audience name and defaults"
-# You'll find your Audience ID at the bottom of the page. It will look something like "1234abcd56"
-# Then update your code with the actual list ID:
